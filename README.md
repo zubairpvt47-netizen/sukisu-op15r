@@ -1,117 +1,92 @@
 <div align="center">
 
-# OnePlus 15R Kernel
+# SUKISU for the OnePlus 15R
 
-**A custom GKI kernel for the OnePlus 15R (CPH2767)**
-KernelSU · SUSFS · NoMount · ZeroMount · Baseband Guard · NTSync · networking · CIFS
+**Our own kernel + our own root manager, built together in one CI run and released together.**
+SUKISU root · SUSFS · KPM · NoMount · ZeroMount · Baseband Guard · NTSync · networking · CIFS
 
 ![Device](https://img.shields.io/badge/device-OnePlus%2015R%20(CPH2767)-eb0028?style=flat-square)
 ![Kernel](https://img.shields.io/badge/kernel-GKI%20android16--6.12-3ddc84?style=flat-square)
-![Root](https://img.shields.io/badge/root-KernelSU-8250df?style=flat-square)
-![Built by](https://img.shields.io/badge/built%20by-GitHub%20Actions-2b3137?style=flat-square)
 ![License](https://img.shields.io/badge/license-GPL--3.0-lightgrey?style=flat-square)
-
-[Features](#features) · [How it works](#how-it-works) · [Build](#building) · [Install](#installing) · [Rollback](#rollback) · [Credits](#credits)
 
 </div>
 
 ---
 
-## Overview
+## What this repository is
 
-The OnePlus 15R ships Google's unmodified **GKI** kernel, and Google publishes the exact source for it.
-This project rebuilds that same kernel for the phone's firmware, in CI, and adds the feature set below.
+The OnePlus 15R ships Google's unmodified **GKI** kernel, and Google publishes the exact source for it. This repository
+rebuilds that kernel for the phone's firmware and adds **SUKISU**: a rebranded build of
+[SukiSU Nova](https://github.com/SukiSU-Nova/SukiSU-Nova) with its own app name, its own Android package name and its own signing key.
 
-- **Matches your firmware.** The build is pinned to the exact upstream commit your phone runs (`expect_commit`), so vendor modules keep working.
-- **Reproducible.** Everything is built from source by a public workflow. The kernel is never committed; the only prebuilt binaries are the stock AnyKernel3 flasher helpers (`busybox`, `magiskboot`, ...) vendored unchanged in `android16-6.12/anykernel3/tools`.
-- **Safe by construction.** The NTSync step is atomic, the final `.config` is checked for every enabled feature, and the build keeps stock module-compatibility settings.
+One workflow run (`.github/workflows/build-op15r.yml`) does three things:
 
-Current default: firmware `CPH2767_17.0.0.106(EX01)`, kernel 6.12.69, upstream source `android16-6.12-2026-03_r54` (`242e1a07f878`).
-`uname -r` reports `6.12.69-android16-6-4k-OP15R-Core-<release_version>`.
+1. **Kernel job**: builds the kernel with the SUKISU root driver built in (SukiSU Nova `builtin-new`, bound to our manager).
+2. **Manager job** (in parallel): builds the SUKISU manager APK from SukiSU Nova `main`, with built-in Zygisk, our package name and icon.
+3. **Release job**: checks that the APK's signing certificate is exactly the one the kernel trusts, then publishes the kernel
+   zip, raw `Image`, manager APK and checksums as one GitHub Release.
+
+## How the kernel and the manager are matched
+
+The kernel only accepts a manager whose **package name** and **signing-certificate (DER size + SHA-256)** equal the values
+compiled into it. Both come from [`branding.env`](branding.env):
+
+| | Value |
+|---|---|
+| App name | `SUKISU` |
+| Package name | `com.op15r.sukisu` |
+| Certificate | size and SHA-256 of our own key (public values, in `branding.env`) |
+
+- The private key exists only as repository secrets (`SUKISU_KEYSTORE_B64`, `SUKISU_KEYSTORE_PASSWORD`) and an offline backup.
+  Because the certificate, not the APK, is what the kernel checks, kernel and manager can be built in parallel.
+- `rebrand/rebrand-kernel.py` writes the package name and certificate into the Nova driver and **removes the extra
+  public/third-party signing keys that upstream also trusts**, so only our certificate can become the manager.
+- The APK is signed v1+v2 only (the driver and `ksud` reject a v3 block) and the release job re-verifies it with `tools/apk_sig.py`.
+- The internal class namespace of the app stays `com.sukisu.nova` (applicationId and namespace may differ; Nova's own PR builds do this).
 
 ## Features
 
-### Root and mount hiding
 | | |
 |---|---|
-| **KernelSU** | Official [tiann/KernelSU](https://github.com/tiann/KernelSU) `main`, built into the kernel at a pinned commit. No LKM or `init_boot` patch needed. Use the manager built from the same commit (see Installing). |
-| **SUSFS** | susfs4ksu with its KernelSU enable patch: path, mount, kstat and map hiding, uname and cmdline/bootconfig spoofing, open redirect, symbol hiding, priority UID filter. Debug logging off. |
-| **NoMount** | Built-in systemless path redirection at the VFS layer (`fs/nomount`), driven by the NoMount module. |
-| **ZeroMount** | Built-in VFS path redirection (`/dev/zeromount`, `fs/zeromount.c`, needs SUSFS), driven by the ZeroMount module. Present alongside NoMount; use one module at a time. |
-| **Baseband Guard** | Security module that blocks writes to critical baseband/modem block devices. It gets its own LSM slot so the stock BPF LSM is not displaced. |
+| **SUKISU root** | SukiSU Nova `builtin-new` driver built into the kernel: App Profile, temporary root grant, jailbreak mode, ADB root, hosts redirect, kernel extension center (CPU/vvar, AVC and version spoofing). No LKM, no `init_boot` patching. |
+| **Manager** | Miuix / Material 3 Expressive UI, theme store, built-in Zygisk (NyaZygisk), KPM module support. |
+| **SUSFS** | susfs4ksu v2.4.0 with Nova's inline hooks: path, mount, kstat and map hiding, uname and cmdline/bootconfig spoofing, open redirect, symbol hiding, priority-UID filter. Debug logging off. |
+| **NoMount / ZeroMount** | Built-in systemless path-redirection drivers (use one userspace module at a time). |
+| **Baseband Guard** | Blocks writes to critical baseband/modem block devices; gets its own LSM slot. |
+| **NTSync** | `/dev/ntsync` for Winlator/GameHub. |
+| **Networking / filesystems** | BBR + fq_codel defaults, CAKE, ip_set, IPv6 NAT, TTL/HL and other netfilter targets; NTFS3, exFAT, VFAT, CIFS/SMB. |
 
-### Extras
-| | |
-|---|---|
-| **NTSync** | NT synchronization primitives for Winlator/GameHub (`/dev/ntsync`). Replaces the stock driver, whose Kconfig entry is marked `BROKEN`, with the current one. |
-| **Networking** | BBR (default congestion control) with fq_codel (default qdisc), Westwood, HTCP, `fq`, CAKE, ip_set (up to 65534 sets), IPv6 NAT, and the `TTL`/`HL`, `DSCP`, `CONNMARK`, `CLASSIFY`, `IDLETIMER`, `NFLOG`, `HMARK` netfilter targets and matches. |
-| **Filesystems** | NTFS3 (read/write USB-OTG drives), exFAT, VFAT, MSDOS, CIFS/SMB client, tmpfs xattr/ACL. |
-
-## How it works
-
-Each build runs these steps in order:
-
-1. **Sync** Google's `kernel/common` at the exact release tag of the phone's kernel, and verify the commit.
-2. **KernelSU** is added as a built-in at a pinned commit, with `KSU_VERSION` pinned from the commit count.
-3. The pinned **SUSFS** patch and KernelSU enable patch are applied with WildKernels' compatibility helpers.
-4. **NoMount** and **ZeroMount** are added as built-ins.
-5. **NTSync** is applied atomically (rolled back if any patch fails) and the networking configs are added.
-6. **Baseband Guard**, its LSM slot and the Kconfig fragment are added.
-7. **Build** with Kleaf/Bazel, check the final `.config` for every enabled feature, then package an AnyKernel3 zip and the raw `Image`.
-
-<details>
-<summary>Stock-compatibility guard rails</summary>
-
-The phone loads hundreds of vendor modules built against Google's GKI ABI, so the build mirrors the stock kernel:
-
-| Stock property (read from the device) | Handling in this build |
-|---|---|
-| `MODVERSIONS`, `PREEMPT`, `MODULE_UNLOAD` (vermagic flags `SMP preempt mod_unload modversions`) | Stripped from the fragment so they can never change. |
-| `LTO_NONE` and `CFI_CLANG` | Built with `--lto=none`, CFI left as stock. |
-| Module version CRC checks | CRC mismatch bypass applied, since struct changes from SUSFS/NoMount/ZeroMount can shift CRCs. |
-| GKI protected-export enforcement | Protected export lists removed so the kernel does not refuse vendor modules. |
-| `ZRAM=m`, `ANDROID_BINDER_IPC_RUST=m` | Left as modules. |
-| `CONFIG_IPV6_SUBTREES`, `MAC80211_MESH` | Not enabled: they change struct layouts that vendor modules use. |
-
-</details>
+Not enabled on purpose: SUSFS debug logging, `KSU_SHELL_HAS_SU_ALWAYS`, `KSU_ENABLE_FULL_UID_CHECKS`,
+`KSU_THRONE_TRACKER_ALWAYS_THREADED` and the ARM64 branch-link / syscall-table hook backends (they are mutually exclusive with SUSFS).
 
 ## Building
 
-1. Open **Actions → OnePlus 15R kernel → Run workflow**.
-2. Keep the defaults for the current firmware, or toggle individual features.
-3. Download the artifact when it finishes:
+1. **Settings → Secrets**: set `SUKISU_KEYSTORE_B64` (base64 of the PKCS#12 keystore, alias `sukisu`) and `SUKISU_KEYSTORE_PASSWORD`.
+2. **Actions → SUKISU build → Run workflow**. Defaults match the current firmware.
+3. When both jobs pass and `publish_release` is on, a **pre-release** appears under *Releases* with:
 
 | File | What it is |
 |---|---|
-| `*-AnyKernel3.zip` | Flashable from a custom recovery. Replaces only the kernel in the active slot's `boot`. |
-| `Image` | Raw arm64 kernel, for repacking or `fastboot boot` testing. |
-| `gkid-report.txt` | Which feature groups and patches applied. |
-| `final-config.fragment` / `final.config` | The Kconfig fragment used and the final `.config`. |
-| `Module.symvers`, `System.map` | ABI evidence for checking vendor-module compatibility. |
-| `SHA256SUMS.txt` | Checksums for the files above. |
+| `*-AnyKernel3.zip` | Flashable from a custom recovery; replaces only the kernel in the active slot's `boot`. |
+| `*-Image` | Raw arm64 kernel. |
+| `SUKISU-op15r-<n>.apk` | The SUKISU manager. |
+| `*-final.config`, `SHA256SUMS.txt` | Final kernel config and checksums. |
 
-Pins live in `android16-6.12/root-pins.env`; `ksu_commit`, `susfs_commit` and `nomount_ref` override them for a single run.
+Pins live in `android16-6.12/root-pins.env` (kernel side) and `branding.env` (manager side).
 
 **New firmware.** Read the kernel string on the phone (`uname -r`) and take the `g<sha>` part. Find the matching
 `android16-6.12-<YYYY-MM>_r<N>` tag in [`kernel/common`](https://android.googlesource.com/kernel/common), then run the
-workflow with `common_ref` (`refs/tags/...`), `release_branch` (`android16-6.12-<YYYY-MM>`) and `expect_commit` (the sha).
-The build aborts if the source does not match that commit.
+workflow with `common_ref`, `release_branch` and `expect_commit`. The build aborts if the source does not match.
 
 ## Installing
 
-> **Status: pre-release.** Do not flash a build that has not passed a test boot on your device.
+> **Status: pre-release.** The Nova-based kernel has been build-checked in CI but has **not** been boot-tested on the phone yet.
 
-Requirements: an **unlocked bootloader**, `adb` and `fastboot`, and **your own partition backups**.
+Requirements: unlocked bootloader, `adb`/`fastboot`, and **your own partition backups**.
 
-1. **Back up** from a root shell, for the slot you use:
-   ```sh
-   S=$(getprop ro.boot.slot_suffix)
-   for p in boot init_boot vendor_boot vbmeta dtbo recovery; do
-     dd if=/dev/block/by-name/$p$S of=/sdcard/bk_$p$S.img
-   done
-   ```
-2. **Flash** the AnyKernel3 zip from your recovery.
-3. **Root.** KernelSU is built in, so use a clean `init_boot` (remove any LKM-patched one) and install the manager APK built from the same KernelSU commit (the pin in `root-pins.env`; KernelSU's CI publishes it as `KernelSU_v<version>-<n>-g<sha>_<code>-release.apk`). The manager and kernel must share the same UAPI version, otherwise the manager reports that it or the kernel needs an update.
+1. Back up `boot` (and `init_boot`, `vendor_boot`, `vbmeta`, `dtbo`) for your active slot.
+2. Flash the AnyKernel3 zip from recovery. Use a clean `init_boot`: SUKISU is built in, so remove any LKM-patched one.
+3. After the first boot, install the SUKISU APK from the same release.
 
 ## Rollback
 
@@ -119,45 +94,27 @@ Requirements: an **unlocked bootloader**, `adb` and `fastboot`, and **your own p
 fastboot flash boot_b boot_b.img      # use your active slot letter
 ```
 
-or flash your saved `boot` image from recovery. The kernel zip only rewrites the kernel inside `boot`; it does not touch
-`recovery`, `vendor_boot`, `vbmeta` or `init_boot`.
+or flash your saved `boot` image from recovery. The zip only rewrites the kernel inside `boot`.
 
 ## Repository layout
 
 ```
-.github/workflows/build-op15r.yml   single-job pipeline: sync, patch, configure, build, package
-android16-6.12/
-  anykernel3/                       vendored AnyKernel3 flasher template (own banner/flash log; see SOURCE.txt)
-  build-helpers/                    config assembly, ABI-check bypass, LSM-slot, build-flag, BBG and SUSFS compat helpers
-  gkid/                             networking config fragments and the NTSync patches
-  zeromount/                        ZeroMount VFS patch
-  defconfig.fragment                base / susfs / overlayfs Kconfig sections
-  root-pins.env                     pinned KernelSU, SUSFS and WildKernels helper commits
-scripts/gkid-extras.sh              NTSync (atomic, with rollback) and networking configs, with report
-tools/repack_boot.py                builds a test-bootable image from a new kernel
+.github/workflows/build-op15r.yml   kernel job + manager job + release job
+branding.env                        app name, package name, certificate values, manager pin
+rebrand/rebrand-manager.sh          app label, strings, own icons, arm64-only (applied to a Nova checkout)
+rebrand/rebrand-kernel.py           package/cert into the driver, drops foreign trusted keys
+tools/apk_sig.py                    prints/verifies the v2 certificate values the kernel compares
+android16-6.12/                     kernel side: AnyKernel3 template, build helpers, GKID configs, ZeroMount patch, pins
+scripts/gkid-extras.sh              NTSync (atomic, with rollback) and networking configs
 ```
 
 ## Disclaimer
 
 Custom kernels can stop a device from booting and may void warranty or break apps that check device integrity.
 You are responsible for your device. Everything here is provided as is, without warranty. This project is not affiliated
-with OnePlus, Google, or any project credited below.
-
-## Credits
-
-| Project | Used for |
-|---|---|
-| [Android Common Kernel](https://android.googlesource.com/kernel/common) (Google) | Base source |
-| [KernelSU](https://github.com/tiann/KernelSU) (tiann) | Root solution |
-| [susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) (simonpunk) | SUSFS |
-| [WildKernels](https://github.com/WildKernels) | SUSFS compatibility scripts, NTSync patches, base of the vendored AnyKernel3 flasher template |
-| [NoMount](https://github.com/maxsteeel/nomount) (maxsteeel) | NoMount driver |
-| [ZeroMount](https://github.com/enginex0/zeromount) and [Enginex0/Super-Builders](https://github.com/Enginex0/Super-Builders) | ZeroMount driver, build pipeline |
-| [GKID-Kernels](https://github.com/ahmed-alnassif/GKID-Kernels) | Networking and filesystem configs |
-| [AnyKernel3](https://github.com/osm0sis/AnyKernel3) (osm0sis) | Flashable-zip framework |
-| [Baseband-guard](https://github.com/vc-teahouse/Baseband-guard) | Baseband Guard module |
+with OnePlus, Google, or any project credited in [NOTICE.md](NOTICE.md).
 
 ## License
 
-Kernel patches are derived from the Linux kernel and carry **GPL-2.0**. Build scripts and workflows derived from Super-Builders
-are **GPL-3.0**. See [LICENSE](LICENSE).
+GPL-3.0 for build scripts, workflows and the rebranded SukiSU Nova parts; kernel patches are derived from the Linux kernel
+(**GPL-2.0**). See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).

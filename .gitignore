@@ -1,0 +1,8 @@
+
+# never commit signing material
+*.p12
+*.jks
+*.keystore
+*.pem
+signing/
+keystore-password*

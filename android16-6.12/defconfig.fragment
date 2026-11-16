@@ -1,5 +1,12 @@
 # [base]
+# SukiSU Nova builtin-new. Hook backend = SUSFS inline hooks (the only one allowed with SUSFS); the ARM64
+# branch-link / syscall-table backends are `depends on !KSU_SUSFS` and are deliberately left off.
 CONFIG_KSU=y
+CONFIG_KSU_LSM_SECURITY_HOOKS=y
+CONFIG_KSU_FEATURE_ADBROOT=y
+CONFIG_KSU_HOSTSREDIRECT=y
+# KPM (APatch-style kernel patch modules); selects KALLSYMS + KALLSYMS_ALL. "may affect stability" per Nova.
+CONFIG_KPM=y
 CONFIG_IP_NF_TARGET_TTL=y
 CONFIG_IP6_NF_TARGET_HL=y
 CONFIG_IP6_NF_MATCH_HL=y
@@ -39,6 +46,7 @@ CONFIG_KALLSYMS_ALL=y
 
 # [susfs]
 CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_INLINE_HOOK=y
 CONFIG_KSU_SUSFS_SUS_PATH=y
 CONFIG_KSU_SUSFS_SUS_MOUNT=y
 CONFIG_KSU_SUSFS_SUS_KSTAT=y

@@ -1,8 +1,10 @@
-name: OnePlus 15R kernel
+name: SUKISU build (OnePlus 15R kernel + manager)
 
-# Rebuilds the exact GKI kernel the phone ships for a given firmware (Google kernel/common
-# release tag) with official KernelSU built in, plus SUSFS, NoMount, ZeroMount, Baseband Guard, NTSync,
-# the networking/filesystem configs and CIFS. To target a new firmware, read `uname -r` on the
+# One run builds, in parallel: (1) the exact GKI kernel the phone ships for a given firmware (Google
+# kernel/common release tag) with the SUKISU root driver (SukiSU Nova `builtin-new`, rebranded and bound to our
+# manager) built in, plus SUSFS, NoMount, ZeroMount, Baseband Guard, NTSync, the networking/filesystem
+# configs and CIFS; and (2) the SUKISU manager APK (our package name, our signing key). The `release` job
+# publishes both to a GitHub Release after proving that the APK's certificate is the one the kernel trusts. To target a new firmware, read `uname -r` on the
 # phone (the g<sha> part), find the matching android16-6.12-<YYYY-MM>_r<N> tag and pass it as
 # common_ref / release_branch.
 #
@@ -57,7 +59,7 @@ on:
         type: boolean
         default: true
       ksu_commit:
-        description: "Override the KernelSU commit (40-char sha; empty = pin from root-pins.env)"
+        description: "Override the SukiSU Nova builtin-new commit (40-char sha; empty = pin from root-pins.env)"
         type: string
         default: ""
       susfs_commit:
@@ -65,7 +67,7 @@ on:
         type: string
         default: ""
       add_ksu:
-        description: "KernelSU built into the kernel (off = root only via external LKM)"
+        description: "SukiSU Nova built into the kernel (off = root only via external LKM)"
         type: boolean
         default: true
       add_susfs:
@@ -79,9 +81,13 @@ on:
       release_version:
         description: "Kernel release version, shown in uname, the AnyKernel3 banner and the artifact name"
         type: string
-        default: "v2.2.0"
+        default: "v3.0.0"
       infra_tweaks:
         description: "Apply CRC-check bypass, protected-export removal and ABI-check bypass"
+        type: boolean
+        default: true
+      publish_release:
+        description: "Publish a GitHub Release (kernel zip + Image + manager APK) when both builds pass"
         type: boolean
         default: true
 
@@ -90,7 +96,7 @@ permissions:
 
 jobs:
   build:
-    name: "KernelSU + SUSFS + NoMount + ZeroMount"
+    name: "Kernel (OnePlus 15R)"
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
@@ -175,7 +181,7 @@ jobs:
         if [ "${{ inputs.clean_baseline }}" = "true" ]; then
           echo "ARTIFACT_BASE=OP15R-${KERNEL_VER}.${SL}-CLEAN-infra-${{ inputs.infra_tweaks }}" >> "$GITHUB_ENV"
         else
-          ROOT=KernelSU
+          ROOT=SUKISU
           [ "${{ inputs.add_ksu }}" = "true" ] || ROOT=NoKSU
           echo "ROOT_LABEL=$ROOT" >> "$GITHUB_ENV"
           SUF=""
@@ -201,39 +207,54 @@ jobs:
     - name: Load source pins
       run: |
         set -a; . "$GITHUB_WORKSPACE/$VERSION_DIR/root-pins.env"; set +a
-        for v in KERNELSU_REPO KERNELSU_PIN SUSFS_REPO SUSFS_BRANCH SUSFS_PIN WK_REPO WK_PIN; do
+        for v in NOVA_REPO NOVA_BRANCH NOVA_PIN SUSFS_REPO SUSFS_BRANCH SUSFS_PIN WK_REPO WK_PIN; do
           echo "$v=${!v}" >> "$GITHUB_ENV"
         done
 
-    - name: Integrate KernelSU
+    - name: Integrate SukiSU Nova (builtin-new)
+      # Same result as `curl .../kernel/setup.sh | bash -s builtin-new` (clone to <root>/KernelSU, symlink into
+      # drivers/kernelsu, Makefile + Kconfig entries), but pinned to a commit and with a fixed version string.
       if: ${{ !inputs.clean_baseline && inputs.add_ksu }}
       working-directory: ${{ env.KERNEL_ROOT }}
       env:
         KSU_OVERRIDE: ${{ inputs.ksu_commit }}
       run: |
         set -euo pipefail
-        REPO="$KERNELSU_REPO"; DIR=ksu-tiann
-        PIN="${KSU_OVERRIDE:-$KERNELSU_PIN}"
-        [[ "$PIN" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::KernelSU commit must be a full 40-char sha"; exit 1; }
+        REPO="$NOVA_REPO"; DIR=nova-ksu   # not "KernelSU": setup.sh's name could collide with a repo folder
+        PIN="${KSU_OVERRIDE:-$NOVA_PIN}"
+        [[ "$PIN" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Nova commit must be a full 40-char sha"; exit 1; }
         [ ! -e common/drivers/kernelsu ] || { echo "::error::common/drivers/kernelsu already exists"; exit 1; }
         [ ! -e "$DIR" ] || { echo "::error::$KERNEL_ROOT/$DIR already exists"; exit 1; }
         echo "KSU_DIR=$DIR" >> "$GITHUB_ENV"
-        # full history: KSU_VERSION is derived from the commit count
+        # setup.sh ends with a `git checkout <ref>` that silently falls back to the default branch when the
+        # ref is misspelled (that gave builds without SUSFS) -> pin by sha and verify the branch really exists.
         for i in 1 2 3 4 5; do git clone --no-checkout "$REPO" "$DIR" && break; rm -rf "./$DIR"; sleep 8; done
+        git -C "$DIR" rev-parse --verify -q "origin/$NOVA_BRANCH" >/dev/null || { echo "::error::branch $NOVA_BRANCH not found in $REPO"; exit 1; }
         git -C "$DIR" fetch origin "$PIN"
         git -C "$DIR" checkout --detach "$PIN"
-        [ "$(git -C "$DIR" rev-parse HEAD)" = "$PIN" ] || { echo "::error::KernelSU commit mismatch"; exit 1; }
-        # Deterministic KSU_VERSION: 30000 + commits at the merge-base with main. KernelSU's Kbuild runs
-        # `git rev-list --count HEAD` inside GIT_ROOT; inside the Kleaf sandbox .git may be unreachable and
-        # the version silently becomes 16 (the manager then reports "kernel too old"), so pin the count.
-        BASE="$(git -C "$DIR" merge-base HEAD origin/main 2>/dev/null || echo "$PIN")"
-        COUNT="$(git -C "$DIR" rev-list --count "$BASE")"
-        TAG="$(git -C "$DIR" describe --tags --abbrev=0 "$BASE" 2>/dev/null || echo unknown)"
-        KB="$DIR/kernel/Kbuild"
-        [ "$(grep -c '^ifdef KSU_GIT_VERSION_VALID' "$KB")" = "1" ] || { echo "::error::KernelSU Kbuild version anchor not found"; exit 1; }
-        sed -i "s/^ifdef KSU_GIT_VERSION_VALID/# CI: deterministic KSU_VERSION\nKSU_GIT_VERSION := ${COUNT}\nKSU_GIT_VERSION_VALID := 1\nifdef KSU_GIT_VERSION_VALID/" "$KB"
-        grep -n -A2 'CI: deterministic KSU_VERSION' "$KB"
-        echo "$DIR @ $(git -C "$DIR" log -1 --format='%h %cs %s') | KSU_VERSION=$((30000 + COUNT)) tag=$TAG"
+        [ "$(git -C "$DIR" rev-parse HEAD)" = "$PIN" ] || { echo "::error::Nova commit mismatch"; exit 1; }
+        git -C "$DIR" merge-base --is-ancestor "$PIN" "origin/$NOVA_BRANCH" ||
+          echo "::warning::$PIN is not on origin/$NOVA_BRANCH (pin override?)"
+        # Deterministic version. kernel/Makefile asks the GitHub API (curl) and `git rev-list --count main`
+        # for KSU_VERSION; inside the Kleaf sandbox neither is reliable, so pin both. Nova's formula is
+        # 30000 + commits - 4001 (VERSION_OFFSET); the manager gates on UAPI (6), not on this number.
+        COUNT="$(git -C "$DIR" rev-list --count "$PIN")"
+        KSU_NUM=$((30000 + COUNT - 4001))
+        SHORT="$(git -C "$DIR" rev-parse --short=8 "$PIN")"
+        MK="$DIR/kernel/Makefile"
+        [ "$(grep -c '^CURL_BIN := ' "$MK")" = "1" ] || { echo "::error::Nova Makefile CURL_BIN anchor not found"; exit 1; }
+        [ "$(grep -c '^KSU_VERSION_FULL := ' "$MK")" = "1" ] || { echo "::error::Nova Makefile KSU_VERSION_FULL anchor not found"; exit 1; }
+        [ "$(grep -c '^KSU_VERSION     := ' "$MK")" = "1" ] || { echo "::error::Nova Makefile KSU_VERSION anchor not found"; exit 1; }
+        # (no trailing "# comments" on these lines: make keeps the spaces before them inside the value, and
+        # KSU_VERSION_FULL ends up inside a C string literal)
+        sed -i "s|^CURL_BIN := .*|CURL_BIN := /usr/bin/env true|" "$MK"
+        sed -i "s|^KSU_VERSION     := .*|KSU_VERSION     := ${KSU_NUM}|" "$MK"
+        sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v3.0.0-${SHORT}@${NOVA_BRANCH}|" "$MK"
+        grep -nE '^(CURL_BIN|KSU_VERSION|KSU_VERSION_FULL) ' "$MK"
+        # Bind the driver to OUR manager (package name + signing certificate) and drop the foreign trusted keys
+        . "$GITHUB_WORKSPACE/branding.env"
+        python3 "$GITHUB_WORKSPACE/rebrand/rebrand-kernel.py" "$DIR" "$PACKAGE_NAME" "$CERT_SIZE" "$CERT_SHA256"
+        echo "$DIR @ $(git -C "$DIR" log -1 --format='%h %cs %s') | KSU_VERSION=${KSU_NUM} | manager package: $(grep -m1 '^KSU_PACKAGE_NAME' "$MK")"
         ln -s "$(realpath --relative-to=common/drivers "$PWD/$DIR/kernel")" common/drivers/kernelsu
         grep -q 'obj-$(CONFIG_KSU) += kernelsu/' common/drivers/Makefile ||
           printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> common/drivers/Makefile
@@ -244,7 +265,9 @@ jobs:
     - name: LSM slot for Baseband Guard (MAX_LSM_COUNT)
       # MAX_LSM_COUNT is derived from the upstream LSM configs only and all 5 slots are used, so a static
       # LSM such as Baseband Guard would make the kernel drop the last ordered LSM (bpf). Count it.
-      # KernelSU itself registers no LSM (it patches hooks at runtime), so it needs no slot.
+      # Nova (KSU_LSM_SECURITY_HOOKS) on 6.8+ ARM64 does not call security_add_hooks(): lsm_hooks_static.c
+      # redirects the security.c callers via kallsyms, so it registers no LSM and needs no slot (the
+      # "no security_add_hooks" step below fails the build if that ever changes).
       if: ${{ inputs.add_bbg && !inputs.clean_baseline }}
       working-directory: ${{ env.KERNEL_ROOT }}
       run: bash "$GITHUB_WORKSPACE/$VERSION_DIR/build-helpers/add-lsm-slots.sh" common BBG=CONFIG_BBG
@@ -325,34 +348,34 @@ jobs:
       working-directory: ${{ env.KERNEL_ROOT }}/common
       run: patch -p1 -F0 --forward --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$VERSION_DIR/zeromount/60_zeromount-${ANDROID_VER}-${KERNEL_VER}.patch"
 
-    - name: Enable SUSFS in KernelSU (10_enable_susfs_for_ksu)
-      # tiann/KernelSU main carries no SUSFS glue; susfs4ksu ships the KSU-side patch, paired
-      # commit-for-commit with the SUSFS pin (same sequence as WildKernels' susfs action).
+    - name: Check Nova <-> SUSFS pairing (no KernelSU-side patch)
+      # Nova builtin-new already has the KernelSU-side SUSFS glue (CONFIG_KSU_SUSFS + inline hooks), so
+      # susfs4ksu's KernelSU/10_enable_susfs_for_ksu.patch is NOT applied (it targets tiann/KernelSU).
+      # Instead prove that the kernel-side SUSFS patch provides every hook Nova's side expects.
       if: ${{ !inputs.clean_baseline && inputs.add_susfs && inputs.add_ksu }}
-      working-directory: ${{ env.KERNEL_ROOT }}/${{ env.KSU_DIR }}
+      working-directory: ${{ env.KERNEL_ROOT }}
       run: |
         set -euo pipefail
-        P="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-        [ -f "$P" ] || { echo "::error::missing $P"; exit 1; }
-        patch -p1 --forward --no-backup-if-mismatch < "$P"
-        grep -q '^config KSU_SUSFS$' kernel/Kconfig || { echo "::error::KSU_SUSFS not defined after the enable patch"; exit 1; }
-        # selinux_hide.c on 6.6+ clang: bare `if (fn)` on a function/pointer is -Werror
-        # (WildKernels "Fix selinux_hide pointer-bool-conversion", ported verbatim)
-        for f in $(find kernel -name selinux_hide.c); do
-          if grep -q "extern void security_dump_masked_av_fn" "$f"; then
-            sed -i 's/if (security_dump_masked_av_fn)/if (\&security_dump_masked_av_fn)/g; s/if (security_dump_masked_av_fn != NULL)/if (\&security_dump_masked_av_fn != NULL)/g; s/if (context_struct_compute_av_fn)/if (\&context_struct_compute_av_fn)/g; s/if (context_struct_compute_av_fn != NULL)/if (\&context_struct_compute_av_fn != NULL)/g' "$f"
-            echo "patched $f (function form)"
-          elif grep -q "if (security_dump_masked_av_fn" "$f"; then
-            sed -i 's/if (security_dump_masked_av_fn)/if (security_dump_masked_av_fn != NULL)/g; s/if (context_struct_compute_av_fn)/if (context_struct_compute_av_fn != NULL)/g' "$f"
-            echo "patched $f (pointer form)"
+        grep -q '^config KSU_SUSFS$' "$KSU_DIR/kernel/Kconfig" || { echo "::error::Nova has no CONFIG_KSU_SUSFS (wrong branch?)"; exit 1; }
+        grep -q '^config KSU_SUSFS_INLINE_HOOK$' "$KSU_DIR/kernel/Kconfig" || { echo "::error::Nova has no KSU_SUSFS_INLINE_HOOK"; exit 1; }
+        [ -f common/fs/susfs.c ] && [ -f common/include/linux/susfs.h ] || { echo "::error::SUSFS kernel side missing"; exit 1; }
+        # every ksu_* function the SUSFS kernel side calls must be defined by Nova (kernel link error otherwise)
+        MISS=0
+        for fn in $(grep -rhoE '\bksu_[a-z0-9_]+\s*\(' common/fs common/include/linux common/kernel common/drivers/input 2>/dev/null \
+                    | sed -E 's/\s*\($//' | sort -u); do
+          if grep -rqE "^[A-Za-z_][A-Za-z0-9_ \*]*\b${fn}\s*\(" "$KSU_DIR/kernel" --include='*.c' --include='*.h'; then
+            echo "ok   $fn"
+          else
+            echo "::error::$fn is called by the SUSFS kernel patch but not defined by Nova"; MISS=1
           fi
         done
-        # a registered KSU LSM (security_add_hooks) needs an LSM slot; that was the old boot panic.
-        # Official KernelSU patches hooks at runtime, so none may appear even after the patch.
-        if grep -rn 'security_add_hooks(' kernel --include='*.c' | grep -v '^\s*//'; then
-          echo "::error::KernelSU registers an LSM via security_add_hooks - needs an LSM slot (add to the LSM step)"; exit 1
+        [ "$MISS" = "0" ] || exit 1
+        # Nova must not register an LSM through security_add_hooks() (that needs a slot; it was the old
+        # boot panic "Too many LSMs registered")
+        if grep -rn 'security_add_hooks(' "$KSU_DIR/kernel" --include='*.c' | grep -v '^\s*//'; then
+          echo "::error::Nova registers an LSM via security_add_hooks - needs an LSM slot (add to the LSM step)"; exit 1
         fi
-        echo "no security_add_hooks() in KernelSU: only BBG needs an LSM slot"
+        echo "no security_add_hooks() in Nova: only BBG needs an LSM slot"
 
     - name: Add NoMount (fs/nomount, built-in)
       # NoMount is a self-contained driver (own inode/dir ops, no hooks in core VFS files), so it
@@ -525,10 +548,16 @@ jobs:
         if [ "${{ inputs.add_ksu }}" = "true" ] && [ "${{ inputs.clean_baseline }}" != "true" ]; then
           [ -n "$CFG" ] || { echo "::error::final .config not found for the KSU/SUSFS assert"; exit 1; }
           echo "--- final config: $CFG"
-          WANT="CONFIG_KSU"
+          # Nova: LSM-hook backend + ADB root + hosts redirect + KPM (the Kernel Extension Center features
+          # have no Kconfig switch: cpu/version/AVC spoofing are always compiled in)
+          WANT="CONFIG_KSU CONFIG_KSU_LSM_SECURITY_HOOKS CONFIG_KSU_FEATURE_ADBROOT CONFIG_KSU_HOSTSREDIRECT CONFIG_KPM CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL"
           if [ "${{ inputs.add_susfs }}" = "true" ]; then
-            WANT="$WANT CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT CONFIG_KSU_SUSFS_SUS_MAP CONFIG_KSU_SUSFS_SPOOF_UNAME"
+            WANT="$WANT CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_INLINE_HOOK CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT CONFIG_KSU_SUSFS_SUS_MAP CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG CONFIG_KSU_SUSFS_OPEN_REDIRECT CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER"
           fi
+          # these two hook backends are mutually exclusive with SUSFS (Kconfig: depends on !KSU_SUSFS)
+          for bad in CONFIG_KSU_HACK_ARM64_BRANCH_LINK CONFIG_KSU_TAMPER_SYSCALL_TABLE; do
+            if grep -qx "${bad}=y" "$CFG"; then echo "::error::$bad=y must not be set together with SUSFS"; exit 1; fi
+          done
           [ "${{ inputs.add_nomount }}" = "true" ] && WANT="$WANT CONFIG_NOMOUNT"
           [ "${{ inputs.add_zeromount }}" = "true" ] && WANT="$WANT CONFIG_ZEROMOUNT"
           [ "${{ inputs.add_bbg }}" = "true" ] && WANT="$WANT CONFIG_BBG"
@@ -601,3 +630,238 @@ jobs:
           cat "$GKID_REPORT" 2>/dev/null || echo "(no gkid report)"
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------------------------------------
+  # Manager APK. Runs in parallel with the kernel job above: the signing certificate (not the APK) is what
+  # the kernel is bound to, and it is fixed in branding.env, so neither job waits for the other.
+  # ------------------------------------------------------------------------------------------------
+  manager:
+    name: "Manager APK (SUKISU)"
+    if: ${{ !inputs.clean_baseline }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NDK_VERSION: "29.0.14206865"
+      ZYGISK_NDK_VERSION: "27.2.12479018"
+      BUILD_TOOLS: "37.0.0"
+    steps:
+    - name: Checkout (branding + rebrand scripts)
+      uses: actions/checkout@v4
+
+    - name: Load branding
+      run: |
+        set -euo pipefail
+        . branding.env
+        case "$CERT_SIZE" in 0x*) ;; *) echo "::error::branding.env has no certificate values yet"; exit 1 ;; esac
+        for v in APP_NAME PACKAGE_NAME CERT_SIZE CERT_SHA256 NOVA_REPO NOVA_MANAGER_PIN; do echo "$v=${!v}" >> "$GITHUB_ENV"; done
+
+    - name: Check signing secrets
+      env:
+        KS_B64: ${{ secrets.SUKISU_KEYSTORE_B64 }}
+        KS_PASS: ${{ secrets.SUKISU_KEYSTORE_PASSWORD }}
+      run: |
+        [ -n "$KS_B64" ] && [ -n "$KS_PASS" ] || { echo "::error::repository secrets SUKISU_KEYSTORE_B64 / SUKISU_KEYSTORE_PASSWORD are not set"; exit 1; }
+
+    - name: Fetch SukiSU Nova (manager side, full history, submodules)
+      run: |
+        set -euo pipefail
+        for i in 1 2 3 4 5; do git clone --no-checkout "$NOVA_REPO" nova && break; rm -rf nova; sleep 8; done
+        git -C nova checkout --detach "$NOVA_MANAGER_PIN"
+        [ "$(git -C nova rev-parse HEAD)" = "$NOVA_MANAGER_PIN" ] || { echo "::error::Nova pin mismatch"; exit 1; }
+        git -C nova submodule update --init --recursive
+        git -C nova log -1 --format='Nova manager source: %h %cs %s'
+
+    - name: Rebrand (name, strings, own icons, arm64 only)
+      run: bash rebrand/rebrand-manager.sh nova
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 21
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v4
+
+    - name: Android SDK / NDK
+      run: |
+        set -euo pipefail
+        SDKM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+        [ -x "$SDKM" ] || SDKM="$(command -v sdkmanager)"
+        yes | "$SDKM" --licenses >/dev/null || true
+        "$SDKM" "platforms;android-37.0" "build-tools;${BUILD_TOOLS}" "ndk;${NDK_VERSION}" "ndk;${ZYGISK_NDK_VERSION}"
+        echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+    - name: Rust toolchains
+      run: |
+        set -euo pipefail
+        rustup update stable
+        rustup target add aarch64-linux-android
+        # BuiltZygisk is built with nightly + cargo-ndk (as upstream)
+        rustup toolchain install nightly --profile minimal --component rust-src
+        rustup target add --toolchain nightly aarch64-linux-android x86_64-linux-android armv7-linux-androideabi
+
+    - name: Install cargo-ndk
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-ndk
+
+    - name: Build BuiltZygisk (built-in Zygisk, NyaZygisk)
+      working-directory: nova/external/BuiltZygisk
+      run: |
+        set -euo pipefail
+        export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/$ZYGISK_NDK_VERSION"
+        rustup override set nightly
+        chmod +x ./gradlew
+        ./gradlew zipRelease -Porg.gradle.parallel=true -Porg.gradle.vfs.watch=true -Dorg.gradle.jvmargs=-Xmx2048m
+
+    - name: Pack BuiltZygisk into ksud assets (aarch64)
+      run: |
+        set -euo pipefail
+        ZIP=$(find nova/external/BuiltZygisk/module/build/outputs/release -type f -name 'NyaZygisk-v*-release.zip' | head -n 1)
+        test -f "$ZIP"
+        rm -rf zy && mkdir zy && unzip -q "$ZIP" -d zy
+        D=nova/userspace/ksud/bin/aarch64
+        cp nova/external/BuiltZygisk/module/src/sepolicy.rule "$D/zygisk-sepolicy.rule"
+        cp zy/module.prop "$D/zygisk-module.prop"
+        cp zy/bin/arm64-v8a/zygiskd "$D/zygiskd"
+        cp zy/lib/arm64-v8a/libzygisk_ptrace.so "$D/zygisk-ptrace"
+        cp zy/lib/arm64-v8a/libzygisk.so "$D/libzygisk.so"
+        [ -f zy/lib/armeabi-v7a/libzygisk.so ] && cp zy/lib/armeabi-v7a/libzygisk.so "$D/libzygisk32.so" || true
+        ls -l "$D"
+
+    - name: Build ksud (aarch64) with our package name
+      working-directory: nova
+      env:
+        KSU_PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+      run: |
+        set -euo pipefail
+        source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+        cargo +stable build --target "$TRIPLE" --release --manifest-path ./userspace/ksud/Cargo.toml
+        ls -l target/aarch64-linux-android/release/ksud
+
+    - name: Put ksud into the manager
+      run: |
+        set -euo pipefail
+        mkdir -p nova/manager/app/src/main/jniLibs/arm64-v8a
+        cp nova/target/aarch64-linux-android/release/ksud nova/manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+
+    - name: Write signing key
+      working-directory: nova/manager
+      env:
+        KS_B64: ${{ secrets.SUKISU_KEYSTORE_B64 }}
+        KS_PASS: ${{ secrets.SUKISU_KEYSTORE_PASSWORD }}
+      run: |
+        set -euo pipefail
+        umask 077
+        printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/sukisu.p12"
+        {
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/sukisu.p12"
+          echo "KEYSTORE_PASSWORD=$KS_PASS"
+          echo "KEY_ALIAS=sukisu"
+          echo "KEY_PASSWORD=$KS_PASS"
+        } >> gradle.properties
+
+    - name: Build the APK
+      working-directory: nova/manager
+      run: |
+        set -euo pipefail
+        chmod +x ./gradlew
+        ./gradlew clean assembleRelease -PKSU_PACKAGE_NAME="$PACKAGE_NAME" -PKSU_NAME="$APP_NAME" --stacktrace
+        ls -l app/build/outputs/apk/release/
+
+    - name: Re-sign (v1+v2 only; the kernel and ksud reject any v3 block) and verify against the kernel
+      env:
+        KS_PASS: ${{ secrets.SUKISU_KEYSTORE_PASSWORD }}
+      run: |
+        set -euo pipefail
+        APK=$(ls nova/manager/app/build/outputs/apk/release/*.apk | head -n 1)
+        mkdir -p out
+        OUT="out/SUKISU-op15r-${GITHUB_RUN_NUMBER}.apk"
+        "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}/apksigner" sign \
+          --ks "$RUNNER_TEMP/sukisu.p12" --ks-key-alias sukisu --ks-pass env:KS_PASS --key-pass env:KS_PASS \
+          --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled false --v4-signing-enabled false \
+          --out "$OUT" "$APK"
+        "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}/apksigner" verify --verbose "$OUT" | head -n 8
+        python3 tools/apk_sig.py "$OUT" --expect-size "$CERT_SIZE" --expect-hash "$CERT_SHA256"
+        # package name actually inside the APK
+        "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}/aapt2" dump badging "$OUT" | grep -E "^package: name=|application-label:" | head -n 3
+        "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}/aapt2" dump badging "$OUT" | grep -q "^package: name='${PACKAGE_NAME}'" \
+          || { echo "::error::APK package name is not ${PACKAGE_NAME}"; exit 1; }
+        sha256sum "$OUT"
+
+    - name: Upload manager APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: manager-apk
+        path: out/*.apk
+        if-no-files-found: error
+
+  # ------------------------------------------------------------------------------------------------
+  # Release: both builds must have passed. Marked as a pre-release because the Nova kernel integration
+  # has not been boot-tested on the phone yet.
+  # ------------------------------------------------------------------------------------------------
+  release:
+    name: "GitHub Release"
+    needs: [build, manager]
+    if: ${{ inputs.publish_release && !inputs.clean_baseline }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Download kernel + manager
+      uses: actions/download-artifact@v4
+      with:
+        path: dl
+
+    - name: Assemble release files
+      env:
+        REL: ${{ inputs.release_version }}
+      run: |
+        set -euo pipefail
+        . branding.env
+        . android16-6.12/root-pins.env
+        mkdir -p rel
+        ls -R dl | head -n 60
+        ZIP=$(find dl -type f -name '*-AnyKernel3.zip' | head -n 1);  test -f "$ZIP"
+        IMG=$(find dl -type f -name 'Image' | head -n 1);              test -f "$IMG"
+        APK=$(find dl -type f -name '*.apk' | head -n 1);              test -f "$APK"
+        CFG=$(find dl -type f -name 'final.config' | head -n 1)
+        cp "$ZIP" rel/; cp "$APK" rel/
+        cp "$IMG" "rel/$(basename "${ZIP%-AnyKernel3.zip}")-Image"
+        [ -n "$CFG" ] && cp "$CFG" "rel/$(basename "${ZIP%-AnyKernel3.zip}")-final.config" || true
+        # the kernel must trust exactly this APK
+        python3 tools/apk_sig.py "rel/$(basename "$APK")" --expect-size "$CERT_SIZE" --expect-hash "$CERT_SHA256"
+        (cd rel && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+        TAG="v${REL}-${GITHUB_RUN_NUMBER}"
+        echo "TAG=$TAG" >> "$GITHUB_ENV"
+        {
+          echo "## ${APP_NAME} for the OnePlus 15R (CPH2767)"
+          echo
+          echo "**Pre-release: build-verified only, not yet boot-tested on a phone.** Flash the AnyKernel3 zip from a recovery"
+          echo "(slot you can restore), keep a stock \`boot\` backup, install the APK **after** the first boot."
+          echo
+          echo "| File | What |"
+          echo "|---|---|"
+          echo "| \`$(basename "$ZIP")\` | kernel (AnyKernel3 flasher) |"
+          echo "| \`$(basename "${ZIP%-AnyKernel3.zip}")-Image\` | raw kernel Image |"
+          echo "| \`$(basename "$APK")\` | ${APP_NAME} manager, package \`${PACKAGE_NAME}\` |"
+          echo
+          echo "- Kernel source: Google \`kernel/common\` for the phone's firmware (see workflow inputs), \`uname -r\` ends with the release tag."
+          echo "- Root driver: SukiSU Nova \`builtin-new\` @ \`${NOVA_PIN:0:8}\`, SUSFS @ \`${SUSFS_PIN:0:8}\`, bound to this APK's signing certificate (size ${CERT_SIZE}, sha256 \`${CERT_SHA256}\`)."
+          echo "- Manager/ksud/Zygisk source: SukiSU Nova \`main\` @ \`${NOVA_MANAGER_PIN:0:8}\`, rebranded; launcher icon is original artwork."
+          echo "- Both parts are GPL-3.0; sources are in this repository and the pinned upstream commits above."
+          echo "- SHA-256 of every file: \`SHA256SUMS.txt\`."
+        } > notes.md
+
+    - name: Create the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        gh release create "$TAG" rel/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+          --prerelease --title "SUKISU ${TAG} (OnePlus 15R)" --notes-file notes.md
+        gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets --jq '.url, (.assets[].name)'

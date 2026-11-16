@@ -840,7 +840,7 @@ jobs:
         # the kernel must trust exactly this APK
         python3 tools/apk_sig.py "rel/$(basename "$APK")" --expect-size "$CERT_SIZE" --expect-hash "$CERT_SHA256"
         (cd rel && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
-        TAG="v${REL}-${GITHUB_RUN_NUMBER}"
+        case "$REL" in v*) TAG="${REL}-${GITHUB_RUN_NUMBER}" ;; *) TAG="v${REL}-${GITHUB_RUN_NUMBER}" ;; esac
         echo "TAG=$TAG" >> "$GITHUB_ENV"
         {
           echo "## ${APP_NAME} for the OnePlus 15R (CPH2767)"

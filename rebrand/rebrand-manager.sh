@@ -108,6 +108,21 @@ XML
 XML
 done
 
+# ---- 3b. KPM tools: pinned commit + hash check (upstream URL moved and tracks a branch) ---------------------
+KPM_BASE="https://raw.githubusercontent.com/${KPM_PATCH_REPO}/${KPM_PATCH_PIN}/kpm"
+[ "$(grep -c 'val baseUrl = "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm"' "$G")" = "1" ] \
+  || { echo "rebrand: KPM baseUrl anchor not found" >&2; exit 1; }
+sed -i "s|val baseUrl = \"https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm\"|val baseUrl = \"${KPM_BASE}\"|" "$G"
+tmp="$(mktemp -d)"
+for pair in "kptools-android:${KPTOOLS_SHA256}" "kpimg:${KPIMG_SHA256}"; do
+  f="${pair%%:*}"; want="${pair#*:}"
+  curl -fsSL --retry 4 -o "$tmp/$f" "$KPM_BASE/$f"
+  got="$(sha256sum "$tmp/$f" | cut -d' ' -f1)"
+  [ "$got" = "$want" ] || { echo "rebrand: $f hash mismatch (got $got)" >&2; exit 1; }
+  echo "rebrand: $f verified ($want)"
+done
+rm -rf "$tmp"
+
 # ---- 4. nothing covered may remain ----------------------------------------------------------------------
 if find "$RES" -type f \( -name 'ic_launcher*.webp' -o -name 'ic_launcher*.png' \) | grep -q .; then
   echo "rebrand: covered bitmap icons still present" >&2; exit 1

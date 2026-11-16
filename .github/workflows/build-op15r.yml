@@ -250,7 +250,11 @@ jobs:
         sed -i "s|^CURL_BIN := .*|CURL_BIN := /usr/bin/env true|" "$MK"
         sed -i "s|^KSU_VERSION     := .*|KSU_VERSION     := ${KSU_NUM}|" "$MK"
         sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v3.0.0-${SHORT}@${NOVA_BRANCH}|" "$MK"
-        grep -nE '^(CURL_BIN|KSU_VERSION|KSU_VERSION_FULL) ' "$MK"
+        # Nova compiles ksu.o with -g0 in non-debug builds, but this GKI kernel runs gendwarfksyms (symbol
+        # versioning) on every object and fails with "no debugging information?" (run 43825917590). Keep DWARF.
+        [ "$(grep -c -- 'CFLAGS_ksu.o += -g0 -fno-unwind-tables' "$MK")" = "1" ] || { echo "::error::Nova Makefile -g0 anchor not found"; exit 1; }
+        sed -i 's/CFLAGS_ksu.o += -g0 -fno-unwind-tables/CFLAGS_ksu.o += -fno-unwind-tables/' "$MK"
+        grep -nE '^(CURL_BIN|KSU_VERSION|KSU_VERSION_FULL) |^CFLAGS_ksu.o \+= -fno-unwind-tables' "$MK"
         # Bind the driver to OUR manager (package name + signing certificate) and drop the foreign trusted keys
         . "$GITHUB_WORKSPACE/branding.env"
         python3 "$GITHUB_WORKSPACE/rebrand/rebrand-kernel.py" "$DIR" "$PACKAGE_NAME" "$CERT_SIZE" "$CERT_SHA256"
